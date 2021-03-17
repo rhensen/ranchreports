@@ -20,21 +20,15 @@ conda install pandas
 #load r packages
 ```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
 library(reticulate)
-library(shiny)
-library(lwgeom)
 library(data.table)
 library(tidyverse)
 library(sf)
 library(sp)
 library(rgdal)
 library(rgeos)
-library(shinythemes)
 library(leaflet)
-library(shinybusy)
-library(rhandsontable)
-#library(mapview)
 library(leaflet.extras)
-library(htmlwidgets)
+
 dirr<- '/Users/reidhensen/Desktop/apps/rangecc.rap'
 setwd(dirr)
 reticulate::use_condaenv("gee", conda = "auto",required = TRUE)
