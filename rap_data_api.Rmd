@@ -1,0 +1,251 @@
+---
+title: "Rangelands Shiny App"
+author: "Reid Hensen"
+date: "3/17/2021"
+output: html_document
+---
+# step 1
+create a conda or pip python library
+
+# step 2 
+run the following lines of code in the terminal 
+
+
+conda create --name gee
+conda activate gee      
+conda install -c conda-forge earthengine-api 
+conda install pandas
+
+
+#load r packages
+```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+library(reticulate)
+library(shiny)
+library(lwgeom)
+library(data.table)
+library(tidyverse)
+library(sf)
+library(sp)
+library(rgdal)
+library(rgeos)
+library(shinythemes)
+library(leaflet)
+library(shinybusy)
+library(rhandsontable)
+#library(mapview)
+library(leaflet.extras)
+library(htmlwidgets)
+
+reticulate::use_condaenv("gee", conda = "auto",required = TRUE)
+```
+#functions
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+ret.rap<- function(shp){
+  shp2<- st_as_sf(shp)
+  pl<- list()
+  for(i in 1:length(shp2$geometry)){
+    df<-st_coordinates(shp2[i,])[,1:2]
+    df<- unname(df)
+    polygon<- lapply(seq.int(nrow(df)), function(x){as.list(df[x,])})
+    rapdat<- py$rapreturn(polygon)
+    df<-rapdat[,2]
+    rsprod_r <- median(df)
+    rsprod_l<- mean(df)-qnorm(.95)*sd(df)
+    rsprod_h = mean(df)+qnorm(.95)*sd(df)
+    Name<- shp2$Name[i]
+    fin<- data.frame(Name,rsprod_l,rsprod_r,rsprod_h)
+    fin2<-retac(shp2[i,])
+    fin<- merge(fin,fin2[,c("Name","acres")], by="Name")
+    names(fin)[5] = "acre_area"
+    pl[[i]]<- fin
+  }
+  pll<- rbindlist(pl)
+  pll<- merge(shp2[,1],pll, by="Name")
+  return(pll)
+}
+retnum<- function(fin,fu, fe, ccpm,ts){
+  fin[is.na(fin)]<- 0
+  fin2<- st_drop_geometry(fin)
+  fin2<- fin2 %>%summarise_at(vars(rsprod_l,rsprod_r,rsprod_h), function(col){fin$acre_area*col})
+  fin2<- cbind(fin$Name,fin2)
+  names(fin2)[1]<- "Name" 
+  fin2<- fin2 %>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),sum)
+  fin.aum<- fin2 %>% group_by(Name)%>%mutate_at(vars(rsprod_l,rsprod_r,rsprod_h),function(col){((col*fe*fu)/(((ccpm*1.1)/30.4)*(ts)))})
+  names(fin.aum)[2:4]<- c("Low","Average","High")
+  return(fin.aum)
+}
+retday<- function(fin,fu, fe, ccpm,h){
+  fin[is.na(fin)]<- 0
+  fin2<- st_drop_geometry(fin)
+  fin2<- fin2 %>%summarise_at(vars(rsprod_l,rsprod_r,rsprod_h), function(col){fin$acre_area*col})
+  fin2<- cbind(fin$Name,fin2)
+  names(fin2)[1]<- "Name" 
+  fin2<- fin2%>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),sum)
+  fin.aum<- fin2 %>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),function(col){((col*fe*fu)/h)/((ccpm*1.1)/30.4)})
+  names(fin.aum)[2:4]<- c("Low","Average","High") 
+  fin.aum[,c(2:4)] <- lapply(fin.aum[,c(2:4)], function(x) ifelse(x> 365, 365, x)) 
+  return(fin.aum)
+}
+retaum<- function(fin,fu, fe){
+  fin[is.na(fin)]<- 0
+  fin2<- st_drop_geometry(fin)
+  fin2<- fin2 %>%summarise_at(vars(rsprod_l,rsprod_r,rsprod_h), function(col){fin$acre_area*col})
+  fin2<- cbind(fin$Name,fin2)
+  names(fin2)[1]<- "Name" 
+  fin2<- fin2%>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),sum)
+  fin.aum<- fin2 %>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),function(col){((col*fe*fu))/(915)})
+  names(fin.aum)[2:4]<- c("Low","Average","High")
+  return(fin.aum)
+}
+
+retac<- function(shp){
+  shp<- shp %>% st_as_sf()
+  shp<- st_transform(shp, 4326)
+  shp<- st_buffer(shp,0)
+  tota <- mutate(shp, total_area = st_area(shp), acres=as.numeric(total_area*0.000247105))%>%st_drop_geometry()
+  return(tota)
+}
+
+shpfilefunc<- function(input){  
+    req(input)
+    shpDF <- input
+    pwd <- getwd()
+    updir <- dirname(shpDF$datapath[1])
+    setwd(updir)
+    for (i in 1:nrow(shpDF)) {
+        file.rename(shpDF$datapath[i], shpDF$name[i])
+    }
+    shpName <- shpDF$name[grep(x = shpDF$name, pattern = "*.shp")]
+    shpPath <- paste(updir, shpName, sep = "/")
+    setwd(pwd)
+    shpFile <- readOGR(shpPath)
+    return(shpFile)
+}
+kmlfilefunc<- function(input){  
+    req(input)
+    kmlFile <- readOGR(input$datapath)
+    return(kmlFile)
+}
+
+drawmap<- function(input){ 
+    x <- input
+    y<- rbindlist(x)
+    names(y)<- c("lon","lat")
+    poly <- y %>% st_as_sf(coords = c("lon", "lat"), crs = 4326) 
+    poly$Name<- "Pasture 1"
+    polys = st_sf(
+      aggregate(
+        poly$geometry,
+        list(poly$Name),
+        function(g){
+          st_cast(st_combine(g),"POLYGON")
+        }
+      ))
+    names(polys)[1]<- "Name"
+    poly<- as(polys, 'Spatial')
+    return(poly)}
+
+```
+
+#create other vars
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+mf<- c(851,913,988,1064,1125,1186,1247,1295,547,638,832,913,1368,1155,135,182,228,152,152,182,547,182,182)
+mfcnam<- c("1000lb cow - dry", "1000lb cow - calf","1100lb cow - calf", "1200lb cow - calf","1300lb cow - calf",
+           "1400lb cow - calf","1500lb cow - calf", "Cattle Bull - mature", "Weaned Calf", "Yearling Cattle (600-800lbs)", "Two-Year-Old Cattle (800-1000lbs)",
+           "Bison Cow - mature", "Bison Bull- mature", 
+           "Horse - mature", "Sheep - dry", "Sheep - lamb", "Sheep Ram", "Goat - mature", "White Tail Deer","Mule Deer","Elk", "Pronghorn", "Bighorn Sheep")
+names(mf)<- mfcnam
+```
+
+
+
+```{python,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+import ee 
+import pandas
+import os
+os.chdir('/Users/reidhensen/Desktop/apps/rangecc.rap')
+service_account = 'rapapi@rapapi.iam.gserviceaccount.com'
+credentials = ee.ServiceAccountCredentials(service_account, 'rapapi-8b815532c31d.json')
+ee.Initialize(credentials) # Initialize the API
+
+
+def rapreturn(polyinput):
+  
+  npp = ee.ImageCollection("projects/rangeland-analysis-platform/npp-partitioned-v2") \
+  .select(['afgNPP', 'pfgNPP'])
+  mat = ee.ImageCollection("projects/rangeland-analysis-platform/gridmet-MAT")
+  
+  
+  # biomass conversion function
+  # input: two band image (afgNPP, pfgNPP) from projects/rangeland-analysis-platform/npp-partitioned-v2
+  # output: three band image, aboveground biomass (afgAGB, pfgAGB, herbaceousAGB)
+  def biomassFunction(image):
+       year = ee.Date(image.get('system:time_start')).format('YYYY')
+       matYear = mat.filterDate(year).first()
+       fANPP = (matYear.multiply(0.0129)).add(0.171).rename('fANPP') # fraction of NPP to allocate aboveground
+       agb = image.multiply(0.0001).multiply(2.20462).multiply(4046.86).multiply(fANPP).multiply(2.1276) \
+          .rename(['afgAGB', 'pfgAGB']) \
+          .copyProperties(image, ['system:time_start']) \
+          .set('year', year)
+       herbaceous = ee.Image(agb).reduce(ee.Reducer.sum()).rename(['herbaceousAGB'])
+       agb = ee.Image(agb).addBands(herbaceous)
+       return agb
+  
+                                
+  geometry = ee.Geometry.Polygon(polyinput)
+  def meanRAP(image):
+    nir = image.select('herbaceousAGB');
+    # Compute the mean of NDVI over the 'region'
+    rapValue = image.reduceRegion(reducer  = ee.Reducer.mean(),
+                              geometry = geometry,
+                              scale= 30,
+                              bestEffort= True)
+    # result of reduceRegion is always a dictionary, so get the element we want
+    return image.set('meanRAP', rapValue)
+  
+  biomass = npp.map(biomassFunction)
+  nv = biomass.map(meanRAP)
+  
+  # reduce the images properties to a list of lists
+  values = nv.reduceColumns(ee.Reducer.toList(2), ['year', 'meanRAP']).values().get(0)
+  eeList = ee.List(values)
+  means = ee.Dictionary(eeList.flatten())
+  mean_values = means.getInfo()
+  
+  pd_df = pandas.DataFrame.from_dict(mean_values, orient='index')
+  return pd_df
+```
+
+```{r}
+p= readOGR("33ranchtest.kml")
+```
+
+```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+fin<- ret.rap(p)
+plotdat<-  retaum(fin,.5,.8)
+plotdat<- plotdat[,c("Name", "Average")]
+shp2<- st_as_sf(p)
+centers <- data.frame(gCentroid(p, byid = TRUE))
+centers$Name <- p$Name
+new<-  merge(plotdat,centers, by="Name")
+new$lab<- paste(round(new[,2],2), " AUMs", sep= "")
+new$num<- new[,2]
+ac<- retac(p)
+mapp<- merge(shp2,ac, by="Name")
+mapp<- merge(mapp,new, by="Name")
+#center<- st_centroid(st_as_sf(uploadfile()()))
+#mapp<- merge(uploadfile()(),ac, by="Name")
+labels2 <- paste(sprintf(
+  "<strong>%s</strong><br/>%g acres <br/>",
+  mapp$Name, round(mapp$acres,0)),new$lab, sep="") %>% lapply(htmltools::HTML)
+pal<-colorNumeric("YlGnBu", mapp$num) 
+leaflet(mapp) %>%
+  addPolygons(stroke = TRUE, fillOpacity = 0.5, smoothFactor = 0.5,
+              color = "black", opacity = 1, fillColor = ~pal(mapp$num), layerId= mapp$Name
+  ) %>% 
+  addLabelOnlyMarkers(data = new,
+                      lng = ~x, lat = ~y, label = ~labels2,
+                      labelOptions = labelOptions(noHide = TRUE, direction = 'top',textsize = "12px"))%>% 
+  addProviderTiles(providers$Esri.WorldTopoMap)
+```
+
