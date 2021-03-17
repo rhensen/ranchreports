@@ -35,7 +35,8 @@ library(rhandsontable)
 #library(mapview)
 library(leaflet.extras)
 library(htmlwidgets)
-
+dirr<- '/Users/reidhensen/Desktop/apps/rangecc.rap'
+setwd(dirr)
 reticulate::use_condaenv("gee", conda = "auto",required = TRUE)
 ```
 #functions
@@ -163,7 +164,7 @@ names(mf)<- mfcnam
 import ee 
 import pandas
 import os
-os.chdir('/Users/reidhensen/Desktop/apps/rangecc.rap')
+os.chdir(r.dirr)
 service_account = 'rapapi@rapapi.iam.gserviceaccount.com'
 credentials = ee.ServiceAccountCredentials(service_account, 'rapapi-8b815532c31d.json')
 ee.Initialize(credentials) # Initialize the API
