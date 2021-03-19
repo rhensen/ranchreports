@@ -102,8 +102,9 @@ shp2<- shp2 %>% rename_(.dots = cols)
 pr<- gridmet(p, 'pr','Name')
 tmax<- gridmet(p, band = 'tmmx')
 tmin<- gridmet(p, band = 'tmmn')
+
 #group precipiation year
-pr %>% group_by(Year,Name)%>% summarise_at(vars(`precip(in)`), sum, na.rm=T)
+pr %>% group_by(Year,Name)%>% summarise_at(vars(pr), sum, na.rm=T)
 ```
 
 
