@@ -1,0 +1,110 @@
+---
+title: "gridmet"
+author: "Reid Hensen"
+date: "3/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(sf)
+```
+
+# Set up python Earth Engine API using either Conda or Pip
+
+run the following lines terminal: 
+
+## Conda Example
+conda create --name gee
+conda activate gee      
+conda install -c conda-forge earthengine-api 
+earthengine authenticate
+conda install pandas
+
+#run this setup environment in R reticulate 
+```{r}
+reticulate::use_condaenv("gee", conda = "auto",required = TRUE)
+```
+
+## Python Code 
+
+```{python}
+import ee 
+from datetime import datetime, timedelta
+
+ee.Initialize() # Initialize the API
+
+# gridmet earth engine function to then be used in R function getgridmet
+def getgridmet(polygon, layer):
+  yesterday = datetime.now() - timedelta(1)
+  year = yesterday.year - 1
+  sst = ee.ImageCollection('IDAHO_EPSCOR/GRIDMET').select([layer]).filterDate(ee.Date('1990-01-01'), ee.Date(yesterday))
+  months = ee.List.sequence(1, 12)
+  years = ee.List.sequence(1990,year)
+  if layer == 'pr':
+    def function1(y):
+        def function2(m):
+            return sst.filter(ee.Filter.calendarRange(y, y, 'year')).filter(ee.Filter.calendarRange(m, m, 'month')).sum().set('month', m).set('year', y)
+        return months.map(function2)
+  else:
+    def function1(y):
+        def function2(m):
+            return sst.filter(ee.Filter.calendarRange(y, y, 'year')).filter(ee.Filter.calendarRange(m, m, 'month')).mean().set('month', m).set('year', y)
+        return months.map(function2)
+  byMonthYear = ee.ImageCollection.fromImages(years.map(function1).flatten())
+  area = ee.Geometry.Polygon(polygon)
+  def reduce_dataset_region(image):
+      # Calculate mean of precipitation on defined area.
+      localred = image.reduceRegion(
+          reducer=ee.Reducer.mean(),
+          geometry=area,
+          scale=4000,
+          bestEffort= True
+      )
+      return image.set('value', localred).set('month', image.get('month')).set('year', image.get('year'))
+  
+  nv = byMonthYear.map(reduce_dataset_region)
+  #print(nv.getInfo())
+  values = nv.reduceColumns(ee.Reducer.toList(3), ['month','year','value']).values().get(0)
+  eeList = ee.List(values)
+  met_values = eeList.getInfo()
+  return met_values
+```
+
+
+```{r}
+p= st_read("33ranchtest.kml")
+#p is the polygon, band= gridmet band from 
+#https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_GRIDMET#bands
+#idcol is a string to define the shapefile identifier column name to be used
+gridmet= function(p, band="pr",idcol){
+shp2<- st_as_sf(p)
+cols <- setNames(idcol,"id")
+shp2<- shp2 %>% rename_(.dots = cols)
+  for(i in 1:length(shp2$geometry)){
+    df<-st_coordinates(shp2[i,])[,1:2]
+    df<- unname(df)
+    polygon<- lapply(seq.int(nrow(df)), function(x){as.list(df[x,])}) #converting sf to earth           engine polygon format, by the individual polygons
+    metdat<- py$getgridmet(polygon,band)
+    suppressWarnings(metdat1<- rbindlist(metdat))
+    id = shp2$id[i]    
+    fin<- data.table(id,metdat1[,1:2])
+    value= unlist(rapdat1$V3)
+    fin = fin[, value := value[1:.N]]
+    if(band=='pr'){fin<- mutate(fin,value= value*0.0393701)}
+    else if(band %in% c('tmmx','tmmn')){fin<- mutate(fin,value = (value*1.8) - 459.67)}
+    names(fin)= c("id","Month","Year",band)
+    pl[[i]]<- fin
+  }
+  pll<- rbindlist(pl)
+  return(pll)
+}
+pr<- gridmet(p, 'pr','Name')
+tmax<- gridmet(p, band = 'tmmx')
+tmin<- gridmet(p, band = 'tmmn')
+#group precipiation year
+pr %>% group_by(Year,Name)%>% summarise_at(vars(`precip(in)`), sum, na.rm=T)
+```
+
+
+
