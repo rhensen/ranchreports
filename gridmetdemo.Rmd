@@ -89,7 +89,7 @@ shp2<- shp2 %>% rename_(.dots = cols)
     suppressWarnings(metdat1<- rbindlist(metdat))
     id = shp2$id[i]    
     fin<- data.table(id,metdat1[,1:2])
-    value= unlist(rapdat1$V3)
+    value= unlist(metdat1$V3)
     fin = fin[, value := value[1:.N]]
     if(band=='pr'){fin<- mutate(fin,value= value*0.0393701)}
     else if(band %in% c('tmmx','tmmn')){fin<- mutate(fin,value = (value*1.8) - 459.67)}
