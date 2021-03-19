@@ -80,6 +80,7 @@ p= st_read("33ranchtest.kml")
 gridmet= function(p, band="pr",idcol){
 shp2<- st_as_sf(p)
 cols <- setNames(idcol,"id")
+pl<- list()
 shp2<- shp2 %>% rename_(.dots = cols)
   for(i in 1:length(shp2$geometry)){
     df<-st_coordinates(shp2[i,])[,1:2]
