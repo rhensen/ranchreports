@@ -14,26 +14,32 @@ run the following lines of code in the terminal
 conda create --name gee
 conda activate gee      
 conda install -c conda-forge earthengine-api 
+earthengine authenticate   
 conda install pandas
 
 
 #load r packages
-```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
 library(reticulate)
+library(lwgeom)
 library(data.table)
 library(tidyverse)
 library(sf)
 library(sp)
 library(rgdal)
 library(rgeos)
+library(shinythemes)
 library(leaflet)
+library(shinybusy)
+library(rhandsontable)
+library(soilDB)
 library(leaflet.extras)
-
-dirr<- '/Users/reidhensen/Desktop/apps/rangecc.rap'
+library(htmlwidgets)
+dirr<- '/Users/reidhensen/Desktop/Coding/apps/rangecc reporting'
 setwd(dirr)
 reticulate::use_condaenv("gee", conda = "auto",required = TRUE)
 ```
-#functions
+
 ```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
 ret.rap<- function(shp){
   shp2<- st_as_sf(shp)
@@ -57,6 +63,63 @@ ret.rap<- function(shp){
   pll<- rbindlist(pl)
   pll<- merge(shp2[,1],pll, by="Name")
   return(pll)
+}
+ret.wss<- function(shp){
+    shp<- shp %>% st_as_sf()
+    shp<- st_buffer(shp,0)
+    ras<- mukey.wcs(shp, db = c("gssurgo"), res = 30, quiet = FALSE)
+    mukeys<- raster::unique(ras$gSSURGO.map.unit.keys)
+    poly<- fetchSDA_spatial(mukeys,by.col = "mukey",
+                            method = "feature",
+                            geom.src = "mupolygon",
+                            db = "SSURGO")
+    spoly<-st_as_sf(poly)
+    shp<- st_transform(shp, st_crs(spoly))
+    
+    intersect_pct <- st_intersection(shp, spoly) %>% 
+        dplyr::mutate(intersect_area = st_area(.))  # create new column with shape area
+    #dplyr::select(Name, mukey,areasymbol, intersect_area,geometry) # only select columns needed to merge
+    tota <- mutate(shp, total_area = st_area(shp)) %>% dplyr::select(Name, total_area)  %>%   # only select columns needed to merge
+        st_drop_geometry()
+    
+    # Merge by county name
+    merg <- merge(intersect_pct,tota, by = "Name")
+    # Calculate coverage
+    merg_2 <- merg%>% 
+        mutate(coverage = as.numeric(intersect_area/total_area),
+               acre_area = as.numeric(intersect_area)*0.000247105,
+               total_acre = as.numeric(total_area)*0.000247105)
+    s<-list()
+    for(i in 1:length(mukeys))
+    {
+        q <- "SELECT areasymbol,component.mukey, muname,component.rsprod_l,component.rsprod_r,component.rsprod_h, muaggatt.niccdcd, muaggatt.wtdepannmin, muaggatt.wtdepannmin, muaggatt.iccdcd
+FROM legend
+INNER JOIN mapunit ON mapunit.lkey = legend.lkey
+INNER JOIN component ON component.mukey = mapunit.mukey
+INNER JOIN muaggatt ON component.mukey = mapunit.mukey
+WHERE component.mukey = " 
+        
+        q2 <- "SELECT areasymbol,component.mukey, component.plantcomname
+FROM legend
+INNER JOIN mapunit ON mapunit.lkey = legend.lkey
+INNER JOIN component ON component.mukey = mapunit.mukey
+WHERE component.mukey = " 
+      
+        m<- paste(mukeys[i],  collapse=", ")
+        options(useFancyQuotes = F)
+        m<-sapply(strsplit(m, '[, ]+'), function(x) toString(sQuote(x)))
+        q2<- paste(q, m, sep = "")
+        s[[i]] <- SDA_query(q2)
+    }
+    soils<- rbindlist(s)
+    #soilnam<- soils[complete.cases(soils),]
+    soilnam<- soils
+    
+    
+    soilf<- merge(merg_2,soilnam, by= c("mukey","areasymbol"))
+    soilf<- soilf%>% dplyr::group_by(Name,muname,mukey)%>% dplyr::summarise_at(vars(rsprod_l,rsprod_r,rsprod_h,acre_area,total_acre), mean, na.rm=T)
+    soilf2<- ungroup(soilf)%>% dplyr::mutate(soilf, id = row_number())
+    return(soilf2)
 }
 retnum<- function(fin,fu, fe, ccpm,ts){
   fin[is.na(fin)]<- 0
@@ -91,6 +154,13 @@ retaum<- function(fin,fu, fe){
   fin.aum<- fin2 %>% group_by(Name)%>%summarize_at(vars(rsprod_l,rsprod_r,rsprod_h),function(col){((col*fe*fu))/(915)})
   names(fin.aum)[2:4]<- c("Low","Average","High")
   return(fin.aum)
+}
+retprod<- function(fin){
+  fin[is.na(fin)]<- 0
+  fin2<- fin
+  fin2<- fin2 %>% group_by(Name)%>%summarise_at(vars(rsprod_l,rsprod_r,rsprod_h),mean)
+  names(fin2)[2:4]<- c("Low","Average","High")
+  return(fin2)
 }
 
 retac<- function(shp){
@@ -139,25 +209,35 @@ drawmap<- function(input){
     names(polys)[1]<- "Name"
     poly<- as(polys, 'Spatial')
     return(poly)}
-
+gridmet= function(p, band="pr"){
+  shp2<- st_as_sf(p)
+  pl<- list()
+  for(i in 1:length(shp2$geometry)){
+    df<-st_coordinates(shp2[i,])[,1:2]
+    df<- unname(df)
+    polygon<- lapply(seq.int(nrow(df)), function(x){as.list(df[x,])}) #converting sf to earth           engine polygon format, by the individual polygons
+    metdat<- py$getgridmet(polygon,band)
+    suppressWarnings(metdat1<- rbindlist(metdat))
+    Name = shp2$Name[i]    
+    fin<- data.table(Name,metdat1[,1:2])
+    value= unlist(metdat1$V3)
+    fin = fin[, value := value[1:.N]]
+    if(band=='pr'){fin<- mutate(fin,value= value*0.0393701)}
+    else if(band %in% c('tmmx','tmmn')){fin<- mutate(fin,value = (value*1.8) - 459.67)}
+    names(fin)= c("Name","Month","Year",band)
+    pl[[i]]<- fin
+  }
+  pll<- rbindlist(pl)
+  return(pll)
+}
 ```
 
-#create other vars
-```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
-mf<- c(851,913,988,1064,1125,1186,1247,1295,547,638,832,913,1368,1155,135,182,228,152,152,182,547,182,182)
-mfcnam<- c("1000lb cow - dry", "1000lb cow - calf","1100lb cow - calf", "1200lb cow - calf","1300lb cow - calf",
-           "1400lb cow - calf","1500lb cow - calf", "Cattle Bull - mature", "Weaned Calf", "Yearling Cattle (600-800lbs)", "Two-Year-Old Cattle (800-1000lbs)",
-           "Bison Cow - mature", "Bison Bull- mature", 
-           "Horse - mature", "Sheep - dry", "Sheep - lamb", "Sheep Ram", "Goat - mature", "White Tail Deer","Mule Deer","Elk", "Pronghorn", "Bighorn Sheep")
-names(mf)<- mfcnam
-```
 
-
-
-```{python,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+```{python, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
 import ee 
 import pandas
 import os
+from datetime import datetime, timedelta
 os.chdir(r.dirr)
 service_account = 'rapapi@rapapi.iam.gserviceaccount.com'
 credentials = ee.ServiceAccountCredentials(service_account, 'rapapi-8b815532c31d.json')
@@ -186,7 +266,6 @@ def rapreturn(polyinput):
        agb = ee.Image(agb).addBands(herbaceous)
        return agb
   
-                                
   geometry = ee.Geometry.Polygon(polyinput)
   def meanRAP(image):
     nir = image.select('herbaceousAGB');
@@ -209,12 +288,251 @@ def rapreturn(polyinput):
   
   pd_df = pandas.DataFrame.from_dict(mean_values, orient='index')
   return pd_df
+
+def rapreturn16(polyinput):
+
+  npp = ee.ImageCollection("projects/rangeland-analysis-platform/npp-partitioned-16day-v2").select(['afgNPP', 'pfgNPP']);
+  mat = ee.ImageCollection("projects/rangeland-analysis-platform/gridmet-MAT");
+  geometry = ee.Geometry.Polygon(polyinput)
+
+  def biomassFunction(image):
+     year = ee.Date(image.get('system:time_start')).format('YYYY')
+     matYear = mat.filterDate(year).first()
+     fANPP = (matYear.multiply(0.0129)).add(0.171).rename('fANPP') # fraction of NPP to allocate aboveground
+     agb = image.multiply(0.0001).multiply(2.20462).multiply(4046.86).multiply(fANPP).multiply(2.1276) \
+        .rename(['afgAGB', 'pfgAGB']) \
+        .copyProperties(image, ['system:time_start']) \
+        .set('year', year)
+     herbaceous = ee.Image(agb).reduce(ee.Reducer.sum()).rename(['herbaceousAGB'])
+     agb = ee.Image(agb).addBands(herbaceous)
+     return agb
+  def meanRAP(image):
+    nir = image.select('herbaceousAGB');
+    # Compute the mean of NDVI over the 'region'
+    rapValue = nir.reduceRegion(reducer  = ee.Reducer.mean(),
+                              geometry = geometry,
+                              scale= 30,
+                              bestEffort= True)
+    # result of reduceRegion is always a dictionary, so get the element we want
+    return image.set('meanRAP', rapValue).set('date', image.get('system:index')).set('year', image.get('year'))
+  
+  biomass = npp.map(biomassFunction)
+  nv = biomass.map(meanRAP)
+  
+  # reduce the images properties to a list of lists
+  values = nv.reduceColumns(ee.Reducer.toList(3), ['system:index','year','meanRAP']).values().get(0)
+  eeList = ee.List(values)
+  mean_values = eeList.getInfo()
+  return(mean_values)
+
+def getgridmet(polygon, layer):
+  yesterday = datetime.now() - timedelta(1)
+  year = yesterday.year 
+  sst = ee.ImageCollection('IDAHO_EPSCOR/GRIDMET').select([layer]).filterDate(ee.Date('1990-01-01'), ee.Date(yesterday))
+  months = ee.List.sequence(1, 12)
+  years = ee.List.sequence(1990,year)
+  if layer == 'pr':
+    def function1(y):
+        def function2(m):
+            return sst.filter(ee.Filter.calendarRange(y, y, 'year')).filter(ee.Filter.calendarRange(m, m, 'month')).sum().set('month', m).set('year', y)
+        return months.map(function2)
+  else:
+    def function1(y):
+        def function2(m):
+            return sst.filter(ee.Filter.calendarRange(y, y, 'year')).filter(ee.Filter.calendarRange(m, m, 'month')).mean().set('month', m).set('year', y)
+        return months.map(function2)
+  byMonthYear = ee.ImageCollection.fromImages(years.map(function1).flatten())
+  area = ee.Geometry.Polygon(polygon)
+  def reduce_dataset_region(image):
+      # Calculate mean of precipitation on defined area.
+      localred = image.reduceRegion(
+          reducer=ee.Reducer.mean(),
+          geometry=area,
+          scale=4000,
+          bestEffort= True
+      )
+      return image.set('value', localred).set('month', image.get('month')).set('year', image.get('year'))
+  
+  nv = byMonthYear.map(reduce_dataset_region)
+  #print(nv.getInfo())
+  values = nv.reduceColumns(ee.Reducer.toList(3), ['month','year','value']).values().get(0)
+  eeList = ee.List(values)
+  mean_values = eeList.getInfo()
+  return mean_values
+  
+def vegcov(polyinput):
+  today= datetime.now()
+  year = today.year - 1
+  yof= str(year)
+  cov = ee.ImageCollection("projects/rangeland-analysis-platform/vegetation-cover-v2").filterDate(ee.Date(yof)).select(['AFGC','BG','LTR','PFGC',"SHR","TREE"])
+  geometry = ee.Geometry.Polygon(polyinput)
+  #need to make geometries a feature collection 
+  
+  def percov(image):
+    # Compute the mean of NDVI over the 'region'
+    covValue = image.reduceRegion(reducer  = ee.Reducer.histogram(),
+                              geometry = geometry,
+                              scale= 30,
+                              bestEffort= True)
+    # result of reduceRegion is always a dictionary, so get the element we want
+    return image.set('covcount', covValue).set('year', image.get('year'))
+  nv = cov.map(percov)
+
+# reduce the images properties to a list of lists
+  values = nv.reduceColumns(ee.Reducer.toList(1), ['covcount']).values().get(0)
+  eeList = ee.List(values)
+  finvalues = eeList.getInfo()
+  return(finvalues)
+    
 ```
 
-```{r}
-p= readOGR("33ranchtest.kml")
+
+### import pasture shape file. It can be a kml or a shapefile, but it must have an attribute titled: "Name" that identifies the the pastures
+
+```{r,  warning = FALSE, message = FALSE}
+p = readOGR("American Creek Pastures.kml")
 ```
 
+
+## Most Recent Veg Cover from Ranglelands.app Pie Chart
+```{r warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+vegplot= function(p){
+  shp= st_as_sf(p)
+  plots=data.table()
+  for(k in 1:nrow(shp)){
+    df<-st_coordinates(shp[k,])[,1:2]
+    df<- unname(df)
+    polygon<- lapply(seq.int(nrow(df)), function(x){as.list(df[x,])}) 
+    veg<- py$vegcov(polygon)
+    dt=data.table()
+    for(i in 1:6){
+      means=unlist(veg[[1]][[1]][[i]][[1]])
+      vals=unlist(veg[[1]][[1]][[i]][[4]])/sum(unlist(veg[[1]][[1]][[i]][[4]]))
+      acres=(means%*%vals)
+      type=names(veg[[1]][[1]])[i]
+      dt1=data.table(type,acres)
+      dt=rbind(dt,dt1)
+    }
+    type2="OTHR"
+    val=100-sum(dt$V1)
+    fin=rbind(dt, list(type2, val))
+    label=data.table(type=c("AFGC","BG","LTR","PFGC","SHR","TREE","OTHR"), lab=c("Annuals","Bare Ground","Litter","Perennials","Shrub","Tree","Other/NA"))
+    fin= merge(fin, label, by="type")
+    fin=fin%>%mutate(prop=V1/100,ypos = cumsum(prop)- 0.5*prop,lables=0)
+    fin$lables[which(fin$prop>=.04)]= paste0(round(fin$prop[which(fin$prop>.04)]*100), "%")
+    fin$lables[which(fin$prop<.04)]=paste0("")
+    fin$Name=shp$Name[k]
+    plots=rbind(plots,fin)
+  }
+  gg=
+    ggplot(plots, aes(x="", y=prop, fill=lab)) +
+      geom_bar(stat="identity", width=1, color="white") +
+      coord_polar("y", start=0) +
+      theme_void() +
+      scale_fill_brewer("Cover Type",palette="Set1")+
+      geom_text(aes(label = lables), position = position_stack(vjust = .5))+
+      facet_wrap(~Name)+
+      labs(caption= "NOTE: Sections with no labels are less than 4%")+ 
+      theme(plot.caption = element_text(size=12),
+        strip.text = element_text(size=14,face="bold"))
+  return(gg)
+}
+```
+
+
+## Peak Production Dates 
+
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+shp= st_as_sf(p)
+tables=list()
+for(k in 1:nrow(shp)){
+df<-st_coordinates(shp[k,])[,1:2]
+df<- unname(df)
+polygon<- lapply(seq.int(nrow(df)), function(x){as.list(df[x,])}) 
+rap16<- py$rapreturn16(polygon)
+df2= rbindlist(rap16)
+df2$V3=replace(df2$V3, sapply(df2$V3, is.null), 0)
+value= unlist(df2$V3)
+day= as.numeric(str_sub(df2$V1,5,7))
+year= df2$V2
+dt= data.table(year,day,value)
+dt2 = dt[dt[, .I[which.max(value)], by=year]$V1]
+ave=format(as.Date(median(dt2$day), origin = "2021-01-01"),format="%m-%d")
+early=format(as.Date(min(dt2$day), origin = "2021-01-01"),format="%m-%d")
+late=format(as.Date(max(dt2$day), origin = "2021-01-01"),format="%m-%d")
+#peak production dates
+name= shp$Name[k]
+fin=data.frame(name,early,ave,late)
+tables[[k]]=fin
+}
+tables
+```
+
+## Precipitation
+
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+pr<- gridmet(p, 'pr')
+#tmax<- gridmet(p, band = 'tmmx',idcol= 'Name')
+#tmin<- gridmet(p, band = 'tmmn',idcol= 'Name')
+#group precipiation year
+yr<- lubridate::year(Sys.Date())
+prr<- pr %>% filter(Year != yr) %>% group_by(Month,Name)%>% summarise_at(vars(pr), mean, na.rm=T)
+pr.yr<- pr %>% filter(Year == yr) %>% select(Name,Month,pr)
+pr.yr[is.na(pr.yr)]= 0
+prplot<- merge(pr.yr,prr, by=c("Name","Month"))
+poa = prplot[which(pr.x>0),] %>% group_by(Name) %>%summarise_at(vars(pr.x,pr.y),sum)%>% mutate(perc_tot=pr.x/pr.y)
+poa = poa[,c("Name","perc_tot")]
+prplot= merge(prplot,poa, by="Name")
+prplot$Name2=paste(prplot$Name," (",round(prplot$perc_tot,2)*100,"% of Norm)",sep="")
+ggplot(prplot)+ 
+  geom_bar(aes(x=Month, y=pr.x, fill=Name2), stat = 'identity',position = position_dodge(width = 0.9))+
+  geom_line(aes(x=Month, y=pr.y, col=Name),size = 1, legend=T)+
+  scale_fill_brewer(name = paste(yr), palette = "Accent") +
+  scale_color_brewer(name= "Average", palette = "Accent") + 
+  labs(title = "Average Precipitation By Pasture", x= "Month", y= "Monthly Precip (inches)")+ 
+  scale_x_continuous(breaks=1:12,labels = function(x) month.abb[x])
+```
+
+
+## Temperature
+
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+tmax<- gridmet(p, band = 'tmmx')
+#tmin<- gridmet(p, band = 'tmmn',idcol= 'Name')
+#group precipiation year
+yr<- lubridate::year(Sys.Date())
+prr<- tmax %>% filter(Year != yr) %>% group_by(Month,Name)%>% summarise_at(vars(tmmx), mean, na.rm=T)
+pr.yr<- tmax %>% filter(Year == yr) %>% select(Name,Month,tmmx)
+pr.yr[is.na(pr.yr)]= 0
+prplot<- merge(pr.yr,prr, by=c("Name","Month"))
+ggplot(prplot)+ 
+  geom_bar(aes(x=Month, y=tmmx.x, fill=Name), stat = 'identity',position = position_dodge(width = 0.9))+
+  geom_line(aes(x=Month, y=tmmx.y, col=Name),size = 1, legend=T)+
+  scale_fill_brewer(name = paste(yr), palette = "Accent") +
+  scale_color_brewer(name= "Average", palette = "Accent") + 
+  labs(title = "Maximum Temperature By Pasture", x= "Month", y= "Monthly Average High (°F)")+ 
+  scale_x_continuous(breaks=1:12,labels = function(x) month.abb[x])
+```
+```{r, warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+tmin<- gridmet(p, band = 'tmmn')
+#tmin<- gridmet(p, band = 'tmmn',idcol= 'Name')
+#group precipiation year
+yr<- lubridate::year(Sys.Date())
+prr<- tmin %>% filter(Year != yr) %>% group_by(Month,Name)%>% summarise_at(vars(tmmn), mean, na.rm=T)
+pr.yr<- tmin %>% filter(Year == yr) %>% select(Name,Month,tmmn)
+pr.yr[is.na(pr.yr)]= 0
+prplot<- merge(pr.yr,prr, by=c("Name","Month"))
+ggplot(prplot)+ 
+  geom_bar(aes(x=Month, y=tmmn.x, fill=Name), stat = 'identity',position = position_dodge(width = 0.9))+
+  geom_line(aes(x=Month, y=tmmn.y, col=Name),size = 1, legend=T)+
+  scale_fill_brewer(name = paste(yr), palette = "Accent") +
+  scale_color_brewer(name= "Average", palette = "Accent") + 
+  labs(title = "Minimum Temperature By Pasture", x= "Month", y= "Monthly Average Low (°F)")+ 
+  scale_x_continuous(breaks=1:12,labels = function(x) month.abb[x])
+```
+
+
+## AUMs
 ```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
 fin<- ret.rap(p)
 plotdat<-  retaum(fin,.5,.8)
@@ -244,3 +562,97 @@ leaflet(mapp) %>%
   addProviderTiles(providers$Esri.WorldTopoMap)
 ```
 
+
+## WSS recovering
+```{r,  warning = FALSE, message = FALSE, include = TRUE, echo = FALSE}
+shp = readOGR("American Creek Pastures.kml")
+    shp<- shp %>% st_as_sf()
+    shp<- st_buffer(shp,0)
+    ras<- mukey.wcs(shp, db = c("gssurgo"), res = 30, quiet = FALSE)
+    mukeys<- raster::unique(ras$gSSURGO.map.unit.keys)
+    poly<- fetchSDA_spatial(mukeys,by.col = "mukey",
+                            method = "feature",
+                            geom.src = "mupolygon",
+                            db = "SSURGO")
+    spoly<-st_as_sf(poly)
+    shp<- st_transform(shp, st_crs(spoly))
+    
+    intersect_pct <- st_intersection(shp, spoly) %>% 
+        dplyr::mutate(intersect_area = st_area(.))  # create new column with shape area
+    #dplyr::select(Name, mukey,areasymbol, intersect_area,geometry) # only select columns needed to merge
+    tota <- mutate(shp, total_area = st_area(shp)) %>% dplyr::select(Name, total_area)  %>%   # only select columns needed to merge
+        st_drop_geometry()
+    
+    # Merge by county name
+    merg <- merge(intersect_pct,tota, by = "Name")
+    # Calculate coverage
+    merg_2 <- merg%>% 
+        mutate(coverage = as.numeric(intersect_area/total_area),
+               acre_area = as.numeric(intersect_area)*0.000247105,
+               total_acre = as.numeric(total_area)*0.000247105)
+    s<-list()
+    for(i in 1:length(mukeys))
+    {
+        q <- "SELECT areasymbol,component.mukey, muname,component.rsprod_l,component.rsprod_r,component.rsprod_h
+FROM legend
+INNER JOIN mapunit ON mapunit.lkey = legend.lkey
+INNER JOIN component ON component.mukey = mapunit.mukey
+WHERE component.mukey ="
+        m<- paste(mukeys[i],  collapse=", ")
+        options(useFancyQuotes = F)
+        m<-sapply(strsplit(m, '[, ]+'), function(x) toString(sQuote(x)))
+        q2<- paste(q, m, sep = "")
+        s[[i]] <- SDA_query(q2)
+    }
+    s2<-list()
+    for(i in 1:length(mukeys))
+    {
+    q <- "SELECT areatypename, areasymbol,component.mukey,component.cokey,coeplants.plantcomname, coecoclass.ecoclassid
+FROM legend
+INNER JOIN mapunit ON mapunit.lkey = legend.lkey
+INNER JOIN component ON component.mukey = mapunit.mukey
+INNER JOIN coecoclass ON coecoclass.cokey = component.cokey
+INNER JOIN coeplants ON coeplants.cokey = component.cokey
+WHERE component.mukey = "
+        m<- paste(mukeys[i],  collapse=", ")
+        options(useFancyQuotes = F)
+        m<-sapply(strsplit(m, '[, ]+'), function(x) toString(sQuote(x)))
+        q2<- paste(q, m, sep = "")
+        s2[[i]] <- SDA_query(q2)
+    }
+    s3<-list()
+    for(i in 1:length(mukeys))
+    {
+       q <- "SELECT muaggatt.mukey, muaggatt.muname, muaggatt.niccdcd,muaggatt.iccdcd,muaggatt.wtdepannmin
+FROM legend
+INNER JOIN mapunit ON mapunit.lkey = legend.lkey
+INNER JOIN muaggatt ON muaggatt.mukey = mapunit.mukey
+WHERE muaggatt.mukey = "
+        m<- paste(mukeys[i],  collapse=", ")
+        options(useFancyQuotes = F)
+        m<-sapply(strsplit(m, '[, ]+'), function(x) toString(sQuote(x)))
+        q2<- paste(q, m, sep = "")
+        s3[[i]] <- SDA_query(q2)
+    }
+    prod<- rbindlist(s)
+    plant<- rbindlist(s2)
+    plants<- unique(plant$plantcomname)
+    esdID<- unique(plants$ecoclassid)
+    cap<- rbindlist(s3)
+   
+#get pdfs dowloads directly to folder 
+lapply(esdID, function(x){
+download.file(paste("https://edit.jornada.nmsu.edu/services/descriptions/esd/",substr(x,2,5),"/",x,"/ecological-dynamics.pdf", sep=""),paste("esd_",x,".pdf", sep=""), mode="wb")
+    })
+
+#get json files of ESD's if available 
+lapply(esdID, function(x){
+esd= read_json(paste("https://edit.jornada.nmsu.edu/services/models/esd/",substr(x,2,5),"/",x,"/states.json", sep=""))
+})
+
+#get production and capacity by polygon
+prod2<- merge(merg_2,prod, by= c("mukey","areasymbol"))
+prod2<- merge(prod2,cap, by= c("mukey" ,"muname"))
+    prod2<- prod2%>% dplyr::group_by(Name,muname,mukey)%>% dplyr::summarise_at(vars(rsprod_l,rsprod_r,rsprod_h,niccdcd,iccdcd, wtdepannmin,acre_area,total_acre), mean, na.rm=T)
+    prod2<- ungroup(prod2)%>% dplyr::mutate(prod2, id = row_number())
+```
